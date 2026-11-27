@@ -1,0 +1,319 @@
+% FOCAL-UMS Method, revised against the executable implementation.
+% Intended for Springer LNCS via \input{method_revised}.
+% Required packages in the main file: amsmath, amssymb, graphicx.
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Problem Setup and Framework Overview}
+\label{sec:setup}
+
+We consider exemplar-free multi-domain continual learning over a sequence of
+$T$ datasets
+$\mathcal{D}_{1:T}=\{\mathcal{D}_1,\ldots,\mathcal{D}_T\}$, where
+$\mathcal{D}_t=\{(x_i^t,y_i^t)\}_{i=1}^{N_t}$ has a task-specific label
+space $\mathcal{Y}_t$.  At step $t$, only $\mathcal{D}_t$ is available for
+optimization; images from $\mathcal{D}_{<t}$ are neither stored nor replayed.
+The evaluated sequence contains ten heterogeneous visual datasets and therefore
+induces both pronounced domain shifts and different prediction heads.
+
+The implementation instantiates two separately pretrained and frozen ViT-B/16
+networks~\cite{dosovitskiy2021vit}.  The local backbone
+$f_{\mathrm{loc}}$ is used for classification and receives additive modulation
+in selected attention projections.  The routing backbone $f_{\mathrm{route}}$
+remains unmodulated and provides a class-token feature for task selection.  For
+each task $t$, a linear bottleneck $b_t:\mathbb{R}^{768}\rightarrow
+\mathbb{R}^{500}$ and a classifier
+$c_t:\mathbb{R}^{500}\rightarrow\mathbb{R}^{|\mathcal{Y}_t|}$ are learned and
+then frozen.
+
+FOCAL-UMS follows an encode--decode process.  Task-specific Fourier
+coefficients first generate additive attention modulations.  After training,
+each modulation is encoded as a fixed-length task coordinate in an incrementally
+constructed \emph{Unified Modulation Subspace} (UMS); at inference, that
+coordinate is decoded into a modulation matrix.  Subspace-aware training and
+post-task refinement connect these two stages by exposing the task parameters
+to the candidate representation during learning and by fitting the shared
+rotation and support decoder after encoding.  Sparse Fourier parameterization
+and Mahalanobis routing are adopted mechanisms.  The methodological focus of
+FOCAL-UMS is the integration of UMS encoding and decoding into sequential
+learning; the refinement objective is one component of this process rather than
+a stand-alone collection of loss functions.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{\detokenize{FOCAL-UMS pipeline with post-task refinement.png}}
+  \caption{FOCAL-UMS.  Task-specific Fourier coefficients are optimized through
+  a candidate UMS map, encoded after training, and refined before decoding.  At
+  inference, one task is selected for the complete grouped query set and its
+  UMS code is decoded into attention modulations.  The anchor regularizes old
+  rotation directions; it does not imply invariant old-task modulations.}
+  \label{fig:focal_ums}
+\end{figure}
+
+\subsection{Task-Specific Frequency Modulation}
+\label{sec:frequency}
+
+We adapt sparse Fourier-domain fine-tuning~\cite{gao2024fourierft} to allocate
+separate trainable coordinates to successive tasks.  Let $d=768$ and let $\pi$
+be a deterministic, seeded permutation of the $d^2$ entries of a square
+spectrum.  The first $Tn_f$ entries are partitioned into pairwise-disjoint
+supports $\Omega_1,\ldots,\Omega_T$, each of cardinality $n_f$.  For task $t$,
+the vector $\boldsymbol{\theta}_t\in\mathbb{R}^{n_f}$ is scattered onto
+$\Omega_t$ to form
+\begin{equation}
+ S_t[u_m,v_m]=\theta_{t,m}\quad ((u_m,v_m)\in\Omega_t),
+ \qquad S_t[u,v]=0\quad ((u,v)\notin\Omega_t).
+ \label{eq:sparse_spectrum}
+\end{equation}
+The corresponding additive weight modulation is
+\begin{equation}
+ \Delta W_t=\alpha\,\operatorname{Re}\!\left(\mathcal{F}^{-1}_2(S_t)\right),
+ \label{eq:ifft_modulation}
+\end{equation}
+where $\mathcal{F}^{-1}_2$ follows the default normalization of
+\texttt{torch.fft.ifft2}.  In the primary configuration, $n_f=5{,}898$ and
+$\alpha=300$.  The model modulates the query, key, value, and output projections
+in blocks $6$--$11$, yielding 24 independent FocalExpert/UMS modules.  Their
+pretrained projection weights remain frozen.
+
+Disjoint supports prevent two tasks from directly updating the same allocated
+raw spectral coordinates.  This statement is deliberately local to the raw
+parameterization: taking the real part in Eq.~\eqref{eq:ifft_modulation}, and
+later applying UMS reconstruction and support gating, does not establish exact
+orthogonality of the resulting spatial updates or guarantee the absence of
+forgetting.
+
+\subsection{UMS-in-the-Loop Training}
+\label{sec:inloop}
+
+Each modulated projection owns a UMS with column bases
+$P,Q\in\mathbb{R}^{d\times R_{\max}}$, a current active rank $r_t$, and a
+shared rotation $O\in\mathbb{R}^{d\times d}$.  UMS-in-the-loop is designed to
+reduce, rather than eliminate, the mismatch between unconstrained task training
+and subsequent subspace encoding.  At task start and at periodic refreshes, the
+current spectrum is transformed to the canonical frame,
+\begin{equation}
+ T_t=O^{\mathsf T}S_tO.
+ \label{eq:canonical}
+\end{equation}
+The implementation removes the component explained by the active left basis,
+computes a truncated SVD of the residual, residualizes the resulting right
+directions against $Q$, and orthonormalizes both sides by QR.  Appending these
+directions to the active columns gives candidate bases
+$P_{\mathrm{c}},Q_{\mathrm{c}}\in\mathbb{R}^{d\times k}$, capped by
+$R_{\max}$.
+
+Let $A=OP_{\mathrm{c}}$ and $B=OQ_{\mathrm{c}}$.  Restricting the induced
+bilinear representation to the current support gives
+\begin{equation}
+ G_t[m,j]=A[u_m,j]B[v_m,j],
+ \qquad G_t\in\mathbb{R}^{n_f\times k}.
+ \label{eq:G}
+\end{equation}
+The coefficients used in the forward pass are
+\begin{equation}
+ \widetilde{\boldsymbol{\theta}}_t
+ =G_t\bigl(G_t^{\mathsf T}\boldsymbol{\theta}_t\bigr),
+ \label{eq:inloop_map}
+\end{equation}
+and are scattered onto $\Omega_t$ before Eq.~\eqref{eq:ifft_modulation}.  The
+matrix $G_t$ is cached without gradients and is refreshed at task start and
+periodically during training.  Because its support-restricted columns are not
+explicitly orthonormal and the code does not apply
+$(G_t^{\mathsf T}G_t)^{-1}$, Eq.~\eqref{eq:inloop_map} is a
+candidate-subspace-induced linear map, not an orthogonal projector.  Cross
+entropy updates the current raw coefficients, bottleneck, and classifier.
+
+\subsection{Post-Task UMS Encoding}
+\label{sec:encoding}
+
+The purpose of post-task encoding is to express each learned modulation through
+shared bases and a task-specific coordinate that can later be decoded.  At task
+completion, the current implementation rebuilds $S_t$ from the
+\emph{raw} slice $\boldsymbol{\theta}_t$ and encodes this matrix into UMS.  It
+does not fold the final in-loop value
+$\widetilde{\boldsymbol{\theta}}_t$ from Eq.~\eqref{eq:inloop_map}; thus the
+in-loop mechanism biases learning toward the candidate representation but does
+not make training and end-task encoding identical.
+
+Let $r_{t-1}$ be the active rank before encoding task $t$, with $r_0=0$.
+For the previously active bases $P_{t-1}=P_{:,1:r_{t-1}}$ and
+$Q_{t-1}=Q_{:,1:r_{t-1}}$, the left residual is
+\begin{equation}
+ U_t=T_t-P_{t-1}(P_{t-1}^{\mathsf T}T_t).
+ \label{eq:left_residual}
+\end{equation}
+A truncated SVD
+$U_t\approx U_s\operatorname{diag}(\boldsymbol{\sigma})V_s^{\mathsf T}$
+provides paired residual directions.  The right directions are additionally
+residualized against $Q_{t-1}$; QR-orthonormalized directions are appended to $P$
+and $Q$ when
+\begin{equation}
+ \mathcal{E}_t=\|U_s\operatorname{diag}(\boldsymbol{\sigma})\|_F^2>\tau
+ \label{eq:residual_energy}
+\end{equation}
+and capacity remains.  In the evaluated configuration,
+$R_{\max}=768$, the truncated-SVD budget is 75, and $\tau=10^{-3}$.  With the
+updated active rank $r_t$ and bases $P_r=P_{:,1:r_t}$ and
+$Q_r=Q_{:,1:r_t}$, task $t$ is encoded as the zero-padded diagonal core
+\begin{equation}
+ z_t=\operatorname{pad}_{R_{\max}}\!\left[
+ \operatorname{diag}\!\left(P_r^{\mathsf T}T_tQ_r\right)\right].
+ \label{eq:task_code}
+\end{equation}
+This is a rank-budgeted diagonal approximation, not an exact factorization of
+the complete core.  UMS codes are used for inference, although the present
+training/checkpoint implementation also retains the preallocated raw
+coefficient tensor.
+
+\subsection{UMS Refinement and Decoding}
+\label{sec:multiobjective}
+
+The purpose of refinement is to reduce the discrepancy between the sparse task
+spectrum and the spectrum decoded from the diagonal UMS coordinate.  A single
+reconstruction term is insufficient for this purpose: it does not identify the
+sparse support, expose off-diagonal energy omitted by $z_t$, or control changes
+to previously used rotation directions.  We therefore optimize the rotation
+and support decoder with a structured objective derived from these encoding
+errors.
+
+The shared orientation is parameterized by the Cayley transform
+\begin{equation}
+ A_{\mathrm{rot}}=W_{\mathrm{rot}}-W_{\mathrm{rot}}^{\mathsf T},\qquad
+ O=\left(I-\tfrac{1}{2}A_{\mathrm{rot}}\right)^{-1}
+   \left(I+\tfrac{1}{2}A_{\mathrm{rot}}\right),
+ \label{eq:cayley}
+\end{equation}
+which is orthogonal in exact arithmetic whenever the solve is well-defined.
+For the current code $z_t$, define the ungated spectral reconstruction and the
+support logits as
+\begin{align}
+ \bar S_t &= OP\operatorname{diag}(z_t)Q^{\mathsf T}O^{\mathsf T},
+ \label{eq:ungated_reconstruction}\\
+ H_t &= W_L\operatorname{diag}(z_t)W_R^{\mathsf T}+\Gamma.
+ \label{eq:support_logits}
+\end{align}
+Here $W_L,W_R\in\mathbb{R}^{d\times R_{\max}}$ and
+$\Gamma\in\mathbb{R}^{d\times d}$ are shared support-decoder parameters.  Let
+$\mathcal{I}_t=\{(u,v):S_t[u,v]\neq0\}$,
+$Y_t[u,v]=\mathbf{1}[(u,v)\in\mathcal{I}_t]$, and
+$C_t=P_r^{\mathsf T}(O^{\mathsf T}S_tO)Q_r$.  For nonempty $\mathcal{I}_t$,
+let $m_t$ be the mean of $\bar S_t$ on $\mathcal{I}_t$ and let
+$s_t=\sqrt{\operatorname{Var}_{\mathcal{I}_t}(\bar S_t)+10^{-8}}$,
+where the variance uses the population denominator.  The code $z_t$ is held
+fixed during refinement.  For $t>1$, let $O^{-},P^{-},Q^{-}$ denote the
+pre-refinement rotation and previously active basis columns, with
+$r_{t-1}$ columns.  The effective refinement objective is
+\begin{align}
+ \mathcal{L}_{\mathrm{UMS}}
+ &=\lambda_{\mathrm{val}}
+   \frac{\sum_{(u,v)\in\mathcal{I}_t}(S_t[u,v]-\bar S_t[u,v])^2}
+        {|\mathcal{I}_t|}
+ +\lambda_{\mathrm{mask}}\operatorname{BCEWithLogits}(H_t,Y_t;w_+)
+ \notag\\
+ &\quad+\lambda_{\mathrm{mom}}\bigl(m_t^2+(s_t-1)^2\bigr)
+ +\lambda_{\mathrm{off}}
+   \frac{\|C_t-\operatorname{diag}(\operatorname{diag}C_t)\|_F^2}
+        {\max\{r_t(r_t-1),1\}}
+ \notag\\
+ &\quad+\lambda_{\mathrm{drift}}
+   \frac{\|(O-O^{-})P^{-}\|_F^2+\|(O-O^{-})Q^{-}\|_F^2}
+        {2r_{t-1}},
+ \label{eq:loss_total}
+\end{align}
+where $w_+=(d^2-n_f)/n_f$ compensates for support imbalance.  The first two
+terms penalize value and support-mask errors, respectively; the moment term
+regularizes the scale of decoded occupied entries; the off-diagonal term
+penalizes canonical-core energy omitted by the diagonal code; and the drift
+term penalizes rotation changes along previously active basis directions.  The
+value and moment terms are zero when $\mathcal{I}_t$ is empty; the drift term
+is zero when there are no previously active columns.  The implemented weights are
+$(\lambda_{\mathrm{val}},\lambda_{\mathrm{mask}},\lambda_{\mathrm{mom}},
+\lambda_{\mathrm{off}},\lambda_{\mathrm{drift}})
+=(1.0,0.1,0.01,0.1,2.0)$.  Refinement uses 15 Adam steps with learning rates
+$10^{-4}$ for $W_{\mathrm{rot}}$ and $10^{-3}$ for the support decoder, after
+which the current task is re-encoded without further basis expansion.
+
+The implementation also forms a nominal drift penalty for the previously
+active columns of $W_L$ and $W_R$.  Its reference tensors are detached views,
+however, rather than independent copies: they share storage with the current
+parameters and change when Adam updates them.  Consequently, their difference
+from the current columns and the resulting penalty and gradient are zero.
+Equation~\eqref{eq:loss_total} therefore states the effective drift term.  The
+anchor does not constrain $\Gamma$, re-encode all previous tasks, or establish
+invariant old-task readouts.  Numerical orthogonality of the Cayley rotation
+can be assessed using the saved diagnostics.
+
+At readout, the support decoder produces a hard gate and the task modulation is
+\begin{equation}
+ M_t=\mathbf{1}[\sigma(H_t)\geq0.5],\qquad
+ \widehat{\Delta W}_t
+ =\alpha\operatorname{Re}\!\left(
+ \mathcal{F}^{-1}_2(\bar S_t\odot M_t)\right).
+ \label{eq:ums_readout}
+\end{equation}
+The gate sets entries predicted as off-support to zero.  This decoding rule is
+approximate and does not establish exact reconstruction or absence of
+inter-task interactions.
+
+\subsection{Dataset-Level Mahalanobis Routing and Inference}
+\label{sec:routing}
+
+The router selects which stored UMS coordinate and task head should be decoded
+for a grouped query set.  We apply the Gaussian-memory expert-selection
+principle used by LEAR~\cite{yu2025lear}.  At the end of task $t$, the complete
+training loader is passed through $f_{\mathrm{route}}$.
+If $h_0(x)\in\mathbb{R}^{768}$ is its
+class token and $u_t(x)=b_t(h_0(x))\in\mathbb{R}^{500}$, the stored statistics
+are
+\begin{equation}
+ \mu_t=\frac{1}{N_t}\sum_i u_t(x_i^t),\qquad
+ \Sigma_t=\operatorname{Cov}\{u_t(x_i^t)\}+10^{-4}I.
+ \label{eq:gaussian_memory}
+\end{equation}
+The diagonal term provides numerical regularization.
+
+The main protocol receives an unlabeled query loader $\mathcal{Q}$ whose
+samples are already grouped by source dataset/domain.  To match the evaluator,
+write $\mathcal{Q}=\{\mathcal{B}_1,\ldots,\mathcal{B}_J\}$ for its mini-batches.
+For candidate task $k$, the evaluator first computes the mean of the square-root
+Mahalanobis distances within each batch and then accumulates these batch means
+with batch-size weights:
+\begin{align}
+ d_k(x)&=\sqrt{(u_k(x)-\mu_k)^{\mathsf T}\Sigma_k^{-1}
+ (u_k(x)-\mu_k)},\notag\\
+ D_{k,j}&=\frac{1}{|\mathcal{B}_j|}\sum_{x\in\mathcal{B}_j}d_k(x),\qquad
+ \bar D_k(\mathcal{Q})=
+ \frac{\sum_{j=1}^{J}|\mathcal{B}_j|D_{k,j}}
+      {\sum_{j=1}^{J}|\mathcal{B}_j|},\notag\\
+ k^\star&=\arg\min_k\bar D_k(\mathcal{Q}).
+ \label{eq:dataset_router}
+\end{align}
+Here labels are not used in the distance calculation.  The final $k^\star$
+after all batches is assigned to the complete loader; the evaluator does not
+route each image independently.  The 24 UMS modules decode $z_{k^\star}$ using
+Eq.~\eqref{eq:ums_readout}, and prediction is
+\begin{equation}
+ \widehat y=c_{k^\star}\!\left(
+ b_{k^\star}\bigl(f_{\mathrm{loc}}(x;\widehat{\Delta W}_{k^\star})\bigr)
+ \right).
+ \label{eq:prediction}
+\end{equation}
+
+\subsection{Storage and Computational Characteristics}
+\label{sec:storage}
+
+One UMS module stores the fixed shared state
+$P,Q,W_L,W_R,W_{\mathrm{rot}},\Gamma$, amounting to
+$4dR_{\max}+2d^2$ scalars; with $d=R_{\max}=768$, the 24 modules contain
+$84{,}934{,}656$ such scalars.  The UMS code itself grows by
+$24R_{\max}=18{,}432$ scalars per task, but the complete task-dependent state
+also includes the bottleneck, classifier, and 500-dimensional Gaussian
+statistics.  Moreover, the present checkpoint retains the preallocated raw
+coefficient tensor.  Hence $n_f/R_{\max}\approx7.68$ characterizes only the
+code-to-spectrum ratio for one module, not end-to-end model storage.  Training
+and consolidation additionally invoke inverse FFTs, dense SVD/QR operations,
+Cayley solves, and support decoding.  Total checkpoint size, consolidation
+time, and inference latency are therefore measured empirically in the
+experiments rather than inferred from the dimension of $z_t$ alone.
